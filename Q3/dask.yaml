@@ -1,0 +1,21 @@
+distributed:
+  worker:
+    memory:
+      terminate: False  # Don't terminate workers that exceed memory
+      pause: 0.8        # Pause at 80% memory use
+    profile:
+      interval: 10ms    # More frequent resource monitoring
+    lifetime:
+      duration: 3600s   # Maximum worker lifetime 1 hour
+    
+  comm:
+    timeouts:
+      connect: 30s      # Increase connection timeout
+      tcp: 30s          # Increase TCP timeout
+    
+  scheduler:
+    worker-ttl: 300s    # How long to wait for missing workers
+    allowed-failures: 20  # Allow more failures before marking task as bad
+
+  client:
+    heartbeat: 10s      # Increase heartbeat interval

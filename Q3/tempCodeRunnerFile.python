@@ -1,0 +1,2156 @@
+# import os
+# import sys
+# import time
+# import gc
+# from datetime import datetime, timedelta
+# import numpy as np
+# import pandas as pd
+# import pyarrow as pa
+# import pyarrow.parquet as pq
+# import warnings
+# warnings.filterwarnings('ignore')
+
+# class ETHFeatureBuilder:
+#     """
+#     Constructs a feature matrix from tick-by-tick ETH/USDT market data
+#     using chunked processing and vectorized operations for memory efficiency and speed.
+#     """
+    
+#     def __init__(self, delta_t=5, volatility_window=60, volatility_avg_intervals=12, tick_history=20, 
+#                  chunk_size_gb=2, use_multiprocessing=False, num_processes=None):
+#         """
+#         Initialize ETH feature builder
+        
+#         Parameters:
+#         -----------
+#         delta_t : int
+#             Sampling interval in seconds
+#         volatility_window : int
+#             Window (in seconds) for volatility calculation
+#         volatility_avg_intervals : int
+#             Number of intervals to average volatility over
+#         tick_history : int
+#             Number of recent trades for tick imbalance calculation
+#         chunk_size_gb : float
+#             Size of each data chunk in GB
+#         use_multiprocessing : bool
+#             Whether to use multiprocessing (can be unstable on Windows)
+#         num_processes : int
+#             Number of processes (None = auto-detect)
+#         """
+#         self.delta_t = delta_t
+#         self.volatility_window = volatility_window
+#         self.volatility_avg_intervals = volatility_avg_intervals
+#         self.tick_history = tick_history
+#         self.chunk_size_gb = chunk_size_gb
+#         self.use_multiprocessing = use_multiprocessing
+        
+#         # Determine processes if multiprocessing is enabled
+#         if use_multiprocessing and num_processes is None:
+#             import multiprocessing
+#             num_processes = max(1, multiprocessing.cpu_count() - 1)
+#         self.num_processes = num_processes if use_multiprocessing else 1
+        
+#         print(f"Initialized with delta_t={delta_t}s, volatility_window={volatility_window}s")
+#         print(f"Processing mode: {'multiprocessing' if use_multiprocessing else 'sequential'}")
+#         if use_multiprocessing:
+#             print(f"Using {num_processes} processes")
+    
+#     def convert_csv_to_parquet(self, csv_path, parquet_dir):
+#         """
+#         Convert CSV to optimized Parquet format for better performance
+        
+#         Parameters:
+#         -----------
+#         csv_path : str
+#             Path to input CSV file
+#         parquet_dir : str
+#             Path to output Parquet directory
+#         """
+#         print(f"Converting CSV to partitioned Parquet format for faster processing...")
+#         start_time = time.time()
+        
+#         # Define column names and types with explicit PyArrow schema
+#         columns = ['trade_id', 'price', 'quantity', 'trade_value', 'timestamp', 'is_buyer_maker', 'is_best_match']
+#         dtypes = {
+#             'trade_id': 'int64',
+#             'price': 'float32',  # Using float32 saves memory
+#             'quantity': 'float32',
+#             'trade_value': 'float32',
+#             'timestamp': 'int64',
+#             'is_buyer_maker': 'bool',
+#             'is_best_match': 'bool'
+#         }
+        
+#         # Create explicit PyArrow schema
+#         pa_schema = pa.schema([
+#             ('trade_id', pa.int64()),
+#             ('price', pa.float32()),
+#             ('quantity', pa.float32()),
+#             ('trade_value', pa.float32()),
+#             ('timestamp', pa.int64()),
+#             ('is_buyer_maker', pa.bool_()),
+#             ('is_best_match', pa.bool_()),
+#             ('datetime', pa.timestamp('us'))
+#         ])
+        
+#         # Ensure output directory exists
+#         os.makedirs(parquet_dir, exist_ok=True)
+        
+#         # Get file size for chunking
+#         file_size_bytes = os.path.getsize(csv_path)
+#         file_size_gb = file_size_bytes / (1024**3)
+        
+#         # Calculate chunk size in rows (approximate)
+#         rows_per_gb = 20_000_000  # Approximate rows per GB based on column types
+#         chunk_size = int(self.chunk_size_gb * rows_per_gb)
+#         total_chunks = int(np.ceil(file_size_gb / self.chunk_size_gb))
+        
+#         print(f"File size: {file_size_gb:.2f} GB")
+#         print(f"Processing in {total_chunks} chunks of ~{self.chunk_size_gb:.1f} GB each")
+        
+#         # Process CSV in chunks to avoid memory issues
+#         chunks_processed = 0
+#         hour_partition_files = {}  # Track files by hour partition
+        
+#         # Configure CSV reader with error handling
+#         reader = pd.read_csv(
+#             csv_path,
+#             chunksize=chunk_size,
+#             header=None,
+#             names=columns,
+#             dtype=dtypes,
+#             error_bad_lines=False,  # Skip bad lines
+#             warn_bad_lines=True     # Warn about them
+#         )
+        
+#         for chunk_idx, chunk in enumerate(reader):
+#             chunk_start_time = time.time()
+#             print(f"Processing chunk {chunk_idx+1}/{total_chunks} ({len(chunk):,} rows)...")
+            
+#             # Convert timestamp to datetime - do this once when loading
+#             chunk['datetime'] = pd.to_datetime(chunk['timestamp'] / 1000000, unit='s')
+            
+#             # Create hour partition
+#             chunk['hour'] = chunk['datetime'].dt.strftime('%Y%m%d_%H')
+            
+#             # Process each hour partition separately
+#             for hour, hour_data in chunk.groupby('hour'):
+#                 # Remove hour column before saving
+#                 hour_data = hour_data.drop(columns=['hour'])
+                
+#                 # Partition path
+#                 partition_path = os.path.join(parquet_dir, f"hour={hour}")
+#                 os.makedirs(partition_path, exist_ok=True)
+                
+#                 # File path for this partition
+#                 if hour in hour_partition_files:
+#                     file_idx = hour_partition_files[hour] + 1
+#                 else:
+#                     file_idx = 0
+                
+#                 hour_partition_files[hour] = file_idx
+#                 file_path = os.path.join(partition_path, f"part-{file_idx:05d}.parquet")
+                
+#                 # Save to parquet with Snappy compression using schema
+#                 table = pa.Table.from_pandas(hour_data, schema=pa_schema)
+#                 pq.write_table(table, file_path, compression='snappy')
+                
+#                 # Also save metadata for min/max timestamps
+#                 min_ts = hour_data['datetime'].min().timestamp()
+#                 max_ts = hour_data['datetime'].max().timestamp()
+#                 metadata_path = os.path.join(partition_path, f"part-{file_idx:05d}.meta")
+#                 with open(metadata_path, 'w') as f:
+#                     f.write(f"{min_ts},{max_ts}")
+            
+#             # Clean up to free memory
+#             del chunk
+#             gc.collect()
+            
+#             chunks_processed += 1
+#             chunk_time = time.time() - chunk_start_time
+#             print(f"Chunk {chunk_idx+1} processed in {chunk_time:.1f} seconds")
+        
+#         # Create manifest file with partition information for quick lookups
+#         manifest = {
+#             'partitions': list(hour_partition_files.keys()),
+#             'creation_time': datetime.now().isoformat(),
+#             'total_partitions': len(hour_partition_files)
+#         }
+        
+#         import json
+#         with open(os.path.join(parquet_dir, '_manifest.json'), 'w') as f:
+#             json.dump(manifest, f)
+        
+#         elapsed_time = time.time() - start_time
+#         print(f"CSV conversion completed in {elapsed_time:.1f} seconds")
+#         print(f"Parquet data saved to {parquet_dir}")
+        
+#         return parquet_dir
+    
+#     def load_tick_data(self, data_path):
+#         """
+#         Prepare tick data for processing - converts to parquet if needed
+        
+#         Parameters:
+#         -----------
+#         data_path : str
+#             Path to the tick data file
+#         """
+#         print(f"Preparing tick data from {data_path}...")
+        
+#         try:
+#             # Check if file exists
+#             if not os.path.exists(data_path):
+#                 raise ValueError(f"Data file not found at {data_path}")
+            
+#             # Check if data is CSV or Parquet
+#             parquet_dir = data_path + "_parquet"
+#             is_csv = data_path.endswith(".csv")
+            
+#             # Convert to Parquet if needed for better performance
+#             if is_csv and not os.path.exists(parquet_dir):
+#                 print(f"Large CSV detected. Converting to Parquet for better performance...")
+#                 self.convert_csv_to_parquet(data_path, parquet_dir)
+#                 self.data_dir = parquet_dir
+#             elif is_csv and os.path.exists(parquet_dir):
+#                 print(f"Using existing Parquet conversion for better performance")
+                
+#                 # Check if parquet directory has data
+#                 if not os.listdir(parquet_dir):
+#                     print(f"Warning: Parquet directory exists but is empty! Re-converting CSV...")
+#                     self.convert_csv_to_parquet(data_path, parquet_dir)
+                
+#                 self.data_dir = parquet_dir
+#             else:
+#                 # Already a directory, assume parquet
+#                 self.data_dir = data_path
+            
+#             # Validate the data directory
+#             if not os.path.exists(self.data_dir):
+#                 raise ValueError(f"Data directory not found: {self.data_dir}")
+                
+#             print(f"Using data directory: {self.data_dir}")
+#             print(f"Directory contents: {os.listdir(self.data_dir)}")
+                
+#             # Load manifest if it exists for efficient partition discovery
+#             manifest_path = os.path.join(self.data_dir, '_manifest.json')
+#             if os.path.exists(manifest_path):
+#                 import json
+#                 with open(manifest_path, 'r') as f:
+#                     manifest = json.load(f)
+#                 self.partitions = manifest['partitions']
+#                 print(f"Loaded {len(self.partitions)} partitions from manifest")
+#             else:
+#                 # Get partitions by scanning directory
+#                 if os.path.isdir(self.data_dir):
+#                     hours = []
+#                     for item in os.listdir(self.data_dir):
+#                         if item.startswith("hour="):
+#                             hours.append(item.replace("hour=", ""))
+#                     hours.sort()
+                    
+#                     if hours:
+#                         self.partitions = hours
+#                         print(f"Found {len(hours)} hour partitions from {hours[0]} to {hours[-1]}")
+                        
+#                         # Validate that the first partition has data
+#                         first_partition = os.path.join(self.data_dir, f"hour={hours[0]}")
+#                         files = [f for f in os.listdir(first_partition) if f.endswith('.parquet')]
+#                         if not files:
+#                             raise ValueError(f"Partition directory exists but contains no parquet files: {first_partition}")
+#                         print(f"First partition ({hours[0]}) contains {len(files)} files")
+#                     else:
+#                         # Not partitioned by hour - check for direct parquet files
+#                         files = [f for f in os.listdir(self.data_dir) if f.endswith('.parquet')]
+#                         if files:
+#                             print(f"Found {len(files)} parquet files in directory (non-partitioned)")
+#                             self.partitions = None
+#                         else:
+#                             raise ValueError(f"No parquet files found in {self.data_dir}")
+#                 else:
+#                     self.partitions = None
+                
+#             # We'll load actual data during processing to manage memory
+#             print(f"Data prepared successfully.")
+            
+#             # Validate by loading a sample
+#             self._validate_data()
+            
+#             return True
+            
+#         except Exception as e:
+#             print(f"Error preparing data: {str(e)}")
+#             import traceback
+#             traceback.print_exc()
+            
+#             # If using existing parquet but validation failed, try reconverting
+#             if is_csv and os.path.exists(parquet_dir) and not hasattr(self, 'data_validated'):
+#                 print("Attempting to reconvert CSV to fix data issues...")
+#                 # Rename existing directory as backup
+#                 backup_dir = parquet_dir + "_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+#                 os.rename(parquet_dir, backup_dir)
+#                 print(f"Moved existing parquet directory to {backup_dir}")
+                
+#                 # Try conversion again
+#                 self.convert_csv_to_parquet(data_path, parquet_dir)
+#                 self.data_dir = parquet_dir
+                
+#                 # Revalidate
+#                 try:
+#                     self._validate_data()
+#                     print("Reconversion successful!")
+#                     return True
+#                 except Exception as e2:
+#                     print(f"Reconversion also failed: {str(e2)}")
+#                     raise
+#             else:
+#                 raise
+    
+#     def _validate_data(self):
+#         """Validate the data by loading a sample"""
+#         if self.partitions:
+#             # Try loading first partition, but only the datetime column for efficiency
+#             first_hour = self.partitions[0]
+#             sample_df = self._load_partition_data(first_hour, columns=['datetime', 'price'])
+#             if len(sample_df) == 0:
+#                 raise ValueError(f"Failed to load any data from partition {first_hour}")
+                
+#             print(f"Successfully loaded {len(sample_df)} rows from first partition")
+#             print(f"Sample data schema: {sample_df.columns.tolist()}")
+#             print(f"Sample data types: {sample_df.dtypes}")
+            
+#             # Make sure datetime column exists
+#             if 'datetime' not in sample_df.columns:
+#                 raise ValueError("Missing required 'datetime' column in data")
+#         else:
+#             # Try loading all data
+#             sample_df = pd.read_parquet(self.data_dir, columns=['datetime', 'price'])
+#             if len(sample_df) == 0:
+#                 raise ValueError("No data found in the parquet files")
+                
+#             print(f"Successfully loaded {len(sample_df)} rows from non-partitioned data")
+                
+#         self.data_validated = True
+    
+#     def _load_partition_data(self, hour=None, columns=None):
+#         """
+#         Load data for a specific hour partition or all data
+        
+#         Parameters:
+#         -----------
+#         hour : str
+#             Hour partition to load (None = all data)
+#         columns : list
+#             Specific columns to load (None = all columns)
+#         """
+#         try:
+#             if hour is not None:
+#                 # Load specific partition
+#                 partition_path = os.path.join(self.data_dir, f"hour={hour}")
+#                 if not os.path.exists(partition_path):
+#                     print(f"Warning: Partition path does not exist: {partition_path}")
+#                     return pd.DataFrame()
+                    
+#                 # Get all parquet files in this partition
+#                 parquet_files = [os.path.join(partition_path, f) for f in os.listdir(partition_path)
+#                                if f.endswith('.parquet')]
+                
+#                 if not parquet_files:
+#                     print(f"Warning: No parquet files found in partition: {partition_path}")
+#                     return pd.DataFrame()
+                
+#                 print(f"Loading {len(parquet_files)} files from partition {hour}")
+                    
+#                 # Load and concatenate
+#                 dfs = []
+#                 for file in parquet_files:
+#                     try:
+#                         # Load only needed columns for efficiency
+#                         df = pd.read_parquet(file, columns=columns)
+#                         dfs.append(df)
+#                     except Exception as e:
+#                         print(f"Error loading file {file}: {str(e)}")
+#                         continue
+                        
+#                 if not dfs:
+#                     print(f"Warning: Failed to load any valid data from partition {hour}")
+#                     return pd.DataFrame()
+                
+#                 # More efficient concat
+#                 result_df = pd.concat(dfs, ignore_index=True, copy=False)
+                
+#                 # Ensure datetime column exists
+#                 if columns is None or 'datetime' in columns:
+#                     if 'datetime' not in result_df.columns and 'timestamp' in result_df.columns:
+#                         try:
+#                             result_df['datetime'] = pd.to_datetime(result_df['timestamp'] / 1000000, unit='s')
+#                         except Exception as e:
+#                             print(f"Failed to create datetime column: {str(e)}")
+                
+#                 return result_df
+#             else:
+#                 # Load all data (careful with memory)
+#                 print(f"Loading all data from {self.data_dir}")
+#                 df = pd.read_parquet(self.data_dir, columns=columns)
+                
+#                 # Ensure datetime column exists
+#                 if columns is None or 'datetime' in columns:
+#                     if 'datetime' not in df.columns and 'timestamp' in df.columns:
+#                         df['datetime'] = pd.to_datetime(df['timestamp'] / 1000000, unit='s')
+                    
+#                 return df
+                
+#         except Exception as e:
+#             print(f"Error loading partition data: {str(e)}")
+#             import traceback
+#             traceback.print_exc()
+#             return pd.DataFrame()
+    
+#     def _get_partition_time_range(self, hour):
+#         """
+#         Get min and max timestamps for a partition without loading all data
+#         by reading metadata or sampling files
+#         """
+#         partition_path = os.path.join(self.data_dir, f"hour={hour}")
+        
+#         # Check for metadata files first
+#         meta_files = [os.path.join(partition_path, f) for f in os.listdir(partition_path)
+#                      if f.endswith('.meta')]
+        
+#         if meta_files:
+#             min_times = []
+#             max_times = []
+            
+#             for meta_file in meta_files:
+#                 try:
+#                     with open(meta_file, 'r') as f:
+#                         min_ts, max_ts = map(float, f.read().split(','))
+#                         min_times.append(min_ts)
+#                         max_times.append(max_ts)
+#                 except Exception:
+#                     continue
+            
+#             if min_times:
+#                 return pd.Timestamp.fromtimestamp(min(min_times)), pd.Timestamp.fromtimestamp(max(max_times))
+        
+#         # Fallback: load just the datetime column from the first file
+#         parquet_files = [os.path.join(partition_path, f) for f in os.listdir(partition_path)
+#                        if f.endswith('.parquet')]
+        
+#         if parquet_files:
+#             try:
+#                 df = pd.read_parquet(parquet_files[0], columns=['datetime'])
+#                 return df['datetime'].min(), df['datetime'].max()
+#             except Exception:
+#                 pass
+                
+#         # Last resort: load all data from the partition
+#         df = self._load_partition_data(hour, columns=['datetime'])
+#         if len(df) > 0:
+#             return df['datetime'].min(), df['datetime'].max()
+            
+#         return None, None
+    
+#     def create_time_grid(self):
+#         """Create the time grid for sampling"""
+#         print("Creating time grid...")
+#         start_time = time.time()
+        
+#         # We need to scan data to find min and max times
+#         min_dt = None
+#         max_dt = None
+        
+#         if hasattr(self, 'partitions') and self.partitions:
+#             # For partitioned data, check first and last partition
+#             partitions = [self.partitions[0], self.partitions[-1]]
+            
+#             for partition in partitions:
+#                 print(f"Scanning partition {partition} for min/max times")
+                
+#                 # Try to get time range from metadata first for efficiency
+#                 part_min, part_max = self._get_partition_time_range(partition)
+                
+#                 if part_min is not None and part_max is not None:
+#                     if min_dt is None or part_min < min_dt:
+#                         min_dt = part_min
+#                     if max_dt is None or part_max > max_dt:
+#                         max_dt = part_max
+#                 else:
+#                     print(f"Warning: Could not determine time range for partition {partition}")
+#         else:
+#             # For non-partitioned data, load only datetime column
+#             print("Loading datetime column to find min/max times")
+            
+#             try:
+#                 df = pd.read_parquet(self.data_dir, columns=['datetime'])
+#                 if len(df) > 0:
+#                     min_dt = df['datetime'].min()
+#                     max_dt = df['datetime'].max()
+#                     print(f"Found data range: {min_dt} to {max_dt}")
+#                 else:
+#                     raise ValueError("No data found")
+#             except Exception as e:
+#                 print(f"Error loading datetime column: {e}")
+                
+#                 # Try to check if 'timestamp' exists and convert
+#                 try:
+#                     df = pd.read_parquet(self.data_dir, columns=['timestamp'])
+#                     if len(df) > 0 and 'timestamp' in df.columns:
+#                         df['datetime'] = pd.to_datetime(df['timestamp'] / 1000000, unit='s')
+#                         min_dt = df['datetime'].min()
+#                         max_dt = df['datetime'].max()
+#                         print(f"Converted from timestamp: {min_dt} to {max_dt}")
+#                     else:
+#                         raise ValueError("No timestamp data found")
+#                 except Exception:
+#                     # CSV fallback as last resort
+#                     if hasattr(self, 'csv_path') and os.path.exists(self.csv_path):
+#                         print("Attempting direct CSV scan for time range...")
+#                         columns = ['timestamp']
+#                         dtypes = {'timestamp': 'int64'}
+                        
+#                         # Read only the timestamp column for first chunk
+#                         first_chunk = next(pd.read_csv(self.csv_path, 
+#                                                chunksize=100000, 
+#                                                header=None, 
+#                                                names=['trade_id', 'price', 'quantity', 'trade_value', 'timestamp', 'is_buyer_maker', 'is_best_match'],
+#                                                usecols=[4],  # Just timestamp column
+#                                                dtype=dtypes))
+#                         first_chunk['datetime'] = pd.to_datetime(first_chunk['timestamp'] / 1000000, unit='s')
+#                         min_dt = first_chunk['datetime'].min()
+                        
+#                         # Get file size to determine where to seek for the last chunk
+#                         file_size = os.path.getsize(self.csv_path)
+#                         chunk_size = 100000  # Approx. rows per chunk
+                        
+#                         # Estimate the number of chunks in file
+#                         total_chunks = file_size / (chunk_size * 50)  # Assuming ~50 bytes per row
+                        
+#                         if total_chunks > 20:  # If file is large enough
+#                             # Read the last chunk directly to find max date
+#                             for i, chunk in enumerate(pd.read_csv(self.csv_path, 
+#                                                    chunksize=chunk_size,
+#                                                    header=None,
+#                                                    names=['trade_id', 'price', 'quantity', 'trade_value', 'timestamp', 'is_buyer_maker', 'is_best_match'],
+#                                                    usecols=[4],
+#                                                    dtype=dtypes)):
+#                                 # Break on the last chunk
+#                                 if i == int(total_chunks) - 1:
+#                                     chunk['datetime'] = pd.to_datetime(chunk['timestamp'] / 1000000, unit='s')
+#                                     max_dt = chunk['datetime'].max()
+#                                     break
+#                         else:
+#                             # For small files, just read all timestamps
+#                             all_timestamps = pd.read_csv(self.csv_path,
+#                                             header=None,
+#                                             names=['trade_id', 'price', 'quantity', 'trade_value', 'timestamp', 'is_buyer_maker', 'is_best_match'],
+#                                             usecols=[4],
+#                                             dtype=dtypes)
+#                             all_timestamps['datetime'] = pd.to_datetime(all_timestamps['timestamp'] / 1000000, unit='s')
+#                             max_dt = all_timestamps['datetime'].max()
+#                     else:
+#                         raise ValueError("Could not determine time range from data")
+        
+#         if min_dt is None or max_dt is None:
+#             raise ValueError("Failed to determine time range from data")
+            
+#         print(f"Creating grid from {min_dt} to {max_dt}")
+        
+#         # Round down min_dt to nearest delta_t
+#         min_dt = min_dt.replace(second=min_dt.second - (min_dt.second % self.delta_t), microsecond=0)
+        
+#         # Create time grid
+#         grid_times = pd.date_range(start=min_dt, end=max_dt, freq=f"{self.delta_t}S")
+        
+#         # Convert to DataFrame with grid index
+#         self.time_grid = pd.DataFrame({
+#             'grid_idx': range(len(grid_times)),
+#             'timestamp': grid_times
+#         })
+        
+#         # Create prev_timestamp for interval calculations
+#         self.time_grid['prev_timestamp'] = self.time_grid['timestamp'].shift(1)
+#         # Fill first row with appropriate value
+#         if len(self.time_grid) > 0:
+#             self.time_grid.loc[0, 'prev_timestamp'] = self.time_grid.loc[0, 'timestamp'] - pd.Timedelta(seconds=self.delta_t)
+        
+#         # Group by hour for partitioned processing
+#         self.time_grid['hour'] = self.time_grid['timestamp'].dt.strftime('%Y%m%d_%H')
+        
+#         elapsed_time = time.time() - start_time
+#         print(f"Created time grid with {len(self.time_grid):,} intervals in {elapsed_time:.1f} seconds")
+        
+#         return self.time_grid
+    
+#     def _calculate_obi_vectorized(self, trades_df, grid_batch, window_size):
+#         """Vectorized calculation of Order Book Imbalance"""
+#         # Create a unique timestamp index on trades to use with resample
+#         if len(trades_df) == 0:
+#             # Return all zeroes if no trades
+#             return pd.DataFrame({'grid_idx': grid_batch['grid_idx'], 'order_book_imbalance': 0})
+        
+#         # Pre-calculate buy and sell volumes
+#         trades_df['buy_volume'] = np.where(~trades_df['is_buyer_maker'], trades_df['quantity'], 0)
+#         trades_df['sell_volume'] = np.where(trades_df['is_buyer_maker'], trades_df['quantity'], 0)
+        
+#         # Create result dataframe with all grid points
+#         result = pd.DataFrame(index=grid_batch.index)
+#         result['grid_idx'] = grid_batch['grid_idx']
+#         result['timestamp'] = grid_batch['timestamp']
+#         result['order_book_imbalance'] = 0  # Default value
+        
+#         # For each grid point, calculate OBI for its window
+#         for idx, row in grid_batch.iterrows():
+#             window_start = row['timestamp'] - pd.Timedelta(seconds=window_size)
+#             window_end = row['timestamp']
+            
+#             # Filter trades in window
+#             mask = (trades_df['datetime'] > window_start) & (trades_df['datetime'] <= window_end)
+#             trades_in_window = trades_df[mask]
+            
+#             if len(trades_in_window) > 0:
+#                 buy_vol = trades_in_window['buy_volume'].sum()
+#                 sell_vol = trades_in_window['sell_volume'].sum()
+#                 total_vol = buy_vol + sell_vol
+                
+#                 if total_vol > 0:
+#                     result.loc[idx, 'order_book_imbalance'] = (buy_vol - sell_vol) / total_vol
+        
+#         return result[['grid_idx', 'order_book_imbalance']]
+    
+#     def _calculate_trade_flow_vectorized(self, trades_df, grid_batch):
+#         """Vectorized calculation of Trade Flow Imbalance, Spread, and Arrival Rate"""
+#         # Prepare result dataframe
+#         result = pd.DataFrame(index=grid_batch.index)
+#         result['grid_idx'] = grid_batch['grid_idx']
+#         result['trade_flow_imbalance'] = 0
+#         result['spread_proxy'] = 0
+#         result['trade_arrival_rate'] = 0
+        
+#         # Pre-calculate buy and sell volumes
+#         trades_df['buy_volume'] = np.where(~trades_df['is_buyer_maker'], trades_df['quantity'], 0)
+#         trades_df['sell_volume'] = np.where(trades_df['is_buyer_maker'], trades_df['quantity'], 0)
+        
+#         if len(trades_df) == 0:
+#             return result[['grid_idx', 'trade_flow_imbalance', 'spread_proxy', 'trade_arrival_rate']]
+        
+#         # Calculate features for each interval
+#         for idx, row in grid_batch.iterrows():
+#             interval_start = row['prev_timestamp']
+#             interval_end = row['timestamp']
+            
+#             # Filter trades in interval
+#             mask = (trades_df['datetime'] > interval_start) & (trades_df['datetime'] <= interval_end)
+#             trades_in_interval = trades_df[mask]
+            
+#             trade_count = len(trades_in_interval)
+            
+#             if trade_count > 0:
+#                 # Trade Flow Imbalance
+#                 buy_vol = trades_in_interval['buy_volume'].sum()
+#                 sell_vol = trades_in_interval['sell_volume'].sum()
+#                 total_vol = buy_vol + sell_vol
+                
+#                 if total_vol > 0:
+#                     result.loc[idx, 'trade_flow_imbalance'] = (buy_vol - sell_vol) / total_vol
+                
+#                 # Spread proxy
+#                 result.loc[idx, 'spread_proxy'] = trades_in_interval['price'].max() - trades_in_interval['price'].min()
+            
+#             # Trade arrival rate (always calculate)
+#             result.loc[idx, 'trade_arrival_rate'] = trade_count / self.delta_t
+            
+#         return result[['grid_idx', 'trade_flow_imbalance', 'spread_proxy', 'trade_arrival_rate']]
+    
+#     def _calculate_volatility_vectorized(self, trades_df, grid_batch):
+#         """Vectorized calculation of Volatility Clusters"""
+#         # Prepare result dataframe
+#         result = pd.DataFrame(index=grid_batch.index)
+#         result['grid_idx'] = grid_batch['grid_idx']
+#         result['vol_i'] = 0
+        
+#         if len(trades_df) == 0:
+#             result['mu_i'] = 0
+#             result['volatility_cluster'] = 1.0
+#             return result[['grid_idx', 'volatility_cluster']]
+        
+#         # Calculate volatility for each window
+#         for idx, row in grid_batch.iterrows():
+#             vol_window_start = row['timestamp'] - pd.Timedelta(seconds=self.volatility_window)
+#             vol_window_end = row['timestamp']
+            
+#             # Filter trades in window
+#             mask = (trades_df['datetime'] > vol_window_start) & (trades_df['datetime'] <= vol_window_end)
+#             trades_in_window = trades_df[mask]
+            
+#             # Calculate std dev
+#             if len(trades_in_window) > 1:
+#                 result.loc[idx, 'vol_i'] = trades_in_window['price'].std()
+        
+#         # Sort by grid_idx for proper rolling calculation
+#         result = result.sort_values('grid_idx')
+        
+#         # Calculate rolling average for volatility clusters
+#         result['mu_i'] = result['vol_i'].rolling(window=self.volatility_avg_intervals, min_periods=1).mean()
+#         result['volatility_cluster'] = np.where(
+#             result['mu_i'] > 0,
+#             result['vol_i'] / result['mu_i'],
+#             1.0
+#         )
+        
+#         return result[['grid_idx', 'volatility_cluster']]
+    
+#     def _calculate_tick_imbalance_vectorized(self, trades_df, grid_batch):
+#         """Optimized calculation of Tick Imbalance"""
+#         # Prepare result dataframe 
+#         result = pd.DataFrame(index=grid_batch.index)
+#         result['grid_idx'] = grid_batch['grid_idx']
+#         result['tick_imbalance'] = 0
+        
+#         if len(trades_df) == 0:
+#             return result[['grid_idx', 'tick_imbalance']]
+            
+#         # Pre-process all trades to calculate price changes
+#         trades_df = trades_df.sort_values('datetime')
+#         trades_df['price_diff'] = trades_df['price'].diff()
+#         trades_df['uptick'] = np.where(trades_df['price_diff'] > 0, 1, 0)
+#         trades_df['downtick'] = np.where(trades_df['price_diff'] < 0, 1, 0)
+        
+#         # For each grid point
+#         for idx, row in grid_batch.iterrows():
+#             grid_time = row['timestamp']
+            
+#             # Get recent trades before this grid point
+#             mask = trades_df['datetime'] <= grid_time
+#             if mask.sum() > 0:
+#                 recent_trades = trades_df[mask].sort_values('datetime', ascending=False).head(self.tick_history + 1)
+                
+#                 if len(recent_trades) > 1:
+#                     # Calculate tick direction on pre-sorted data (oldest to newest)
+#                     recent_trades = recent_trades.sort_values('datetime')
+                    
+#                     # Count upticks and downticks using pre-calculated values
+#                     upticks = recent_trades['uptick'].sum()
+#                     downticks = recent_trades['downtick'].sum()
+                    
+#                     total_ticks = upticks + downticks
+#                     if total_ticks > 0:
+#                         result.loc[idx, 'tick_imbalance'] = (upticks - downticks) / total_ticks
+        
+#         return result[['grid_idx', 'tick_imbalance']]
+    
+#     def _process_hour_batch(self, hour):
+#         """
+#         Process a single hour worth of data with vectorized operations
+#         """
+#         print(f"Processing hour {hour}...")
+#         batch_start_time = time.time()
+        
+#         # Get time grid points for this hour
+#         grid_batch = self.time_grid[self.time_grid['hour'] == hour].copy()
+#         if len(grid_batch) == 0:
+#             print(f"No grid points in hour {hour}, skipping")
+#             return pd.DataFrame()
+        
+#         # Load trade data for this hour plus window before
+#         # To ensure we have enough data for features that look back in time
+#         hour_dt = datetime.strptime(hour, '%Y%m%d_%H')
+        
+#         # For volatility calculations, we need data from the previous hour too
+#         lookback_time = max(self.volatility_window, self.delta_t * self.tick_history) + 60  # Add 1 minute margin
+#         lookback_hour = (hour_dt - timedelta(seconds=lookback_time)).strftime('%Y%m%d_%H')
+        
+#         # Load data from both current and previous hour if needed
+#         trades_df = self._load_partition_data(hour)
+        
+#         if lookback_hour != hour and hasattr(self, 'partitions') and lookback_hour in self.partitions:
+#             prev_hour_trades = self._load_partition_data(lookback_hour)
+#             trades_df = pd.concat([prev_hour_trades, trades_df], ignore_index=True, copy=False)
+        
+#         if len(trades_df) == 0:
+#             print(f"No trade data for hour {hour}, skipping")
+#             return pd.DataFrame()
+        
+#         # Sort by time once for all operations
+#         trades_df = trades_df.sort_values('datetime')
+        
+#         # Initialize features dataframe
+#         features = grid_batch.copy()
+        
+#         # 1. Calculate Order Book Imbalance (vectorized)
+#         start = time.time()
+#         window_size = max(30, self.delta_t * 3)
+#         obi_df = self._calculate_obi_vectorized(trades_df, grid_batch, window_size)
+#         print(f"OBI calculation: {time.time() - start:.1f}s")
+        
+#         # 2. Calculate Trade Flow Imbalance, Spread Proxy, and Arrival Rate (vectorized)
+#         start = time.time()
+#         tfi_df = self._calculate_trade_flow_vectorized(trades_df, grid_batch)
+#         print(f"TFI/Spread/Arrival calculation: {time.time() - start:.1f}s")
+        
+#         # 3. Calculate Volatility Clusters (vectorized)
+#         start = time.time()
+#         vol_df = self._calculate_volatility_vectorized(trades_df, grid_batch)
+#         print(f"Volatility calculation: {time.time() - start:.1f}s")
+        
+#         # 4. Calculate Tick Imbalance (vectorized)
+#         start = time.time()
+#         tick_df = self._calculate_tick_imbalance_vectorized(trades_df, grid_batch)
+#         print(f"Tick Imbalance calculation: {time.time() - start:.1f}s")
+        
+#         # Merge all features
+#         features = features.merge(obi_df, on='grid_idx', how='left')
+#         features = features.merge(tfi_df, on='grid_idx', how='left')
+#         features = features.merge(vol_df, on='grid_idx', how='left')
+#         features = features.merge(tick_df, on='grid_idx', how='left')
+        
+#         # Fill NAs with 0
+#         features = features.fillna(0)
+        
+#         # Free memory
+#         del trades_df, obi_df, tfi_df, vol_df, tick_df
+#         gc.collect()
+        
+#         elapsed_time = time.time() - batch_start_time
+#         print(f"Hour {hour} completed in {elapsed_time:.1f} seconds")
+        
+#         return features
+    
+#     def _process_hour_parallel(self, hour):
+#         """Wrapper for parallel processing of hours"""
+#         try:
+#             return self._process_hour_batch(hour)
+#         except Exception as e:
+#             print(f"Error processing hour {hour}: {str(e)}")
+#             return pd.DataFrame()
+    
+#     def build_feature_matrix(self):
+#         """Build the complete feature matrix"""
+#         print("Building feature matrix...")
+#         start_time = time.time()
+        
+#         # Create time grid if not already created
+#         if not hasattr(self, 'time_grid'):
+#             self.create_time_grid()
+        
+#         # Get unique hours to process
+#         unique_hours = self.time_grid['hour'].unique()
+#         print(f"Processing {len(unique_hours)} unique hours")
+        
+#         results = []
+        
+#         # Process either in parallel or sequentially
+#         if self.use_multiprocessing:
+#             try:
+#                 from pathos.multiprocessing import ProcessPool
+                
+#                 print(f"Processing hours in parallel with {self.num_processes} processes")
+#                 with ProcessPool(nodes=self.num_processes) as pool:
+#                     results = pool.map(self._process_hour_parallel, unique_hours)
+#             except ImportError:
+#                 print("pathos not installed, falling back to standard multiprocessing")
+#                 try:
+#                     from multiprocessing import Pool
+                    
+#                     print(f"Processing hours in parallel with {self.num_processes} processes")
+#                     with Pool(processes=self.num_processes) as pool:
+#                         results = pool.map(self._process_hour_parallel, unique_hours)
+#                 except Exception as e:
+#                     print(f"Multiprocessing failed: {str(e)}")
+#                     print("Falling back to sequential processing")
+#                     for hour in unique_hours:
+#                         hour_result = self._process_hour_batch(hour)
+#                         results.append(hour_result)
+#             except Exception as e:
+#                 print(f"Multiprocessing failed: {str(e)}")
+#                 print("Falling back to sequential processing")
+#                 for hour in unique_hours:
+#                     hour_result = self._process_hour_batch(hour)
+#                     results.append(hour_result)
+#         else:
+#             # Process sequentially
+#             for hour in unique_hours:
+#                 hour_result = self._process_hour_batch(hour)
+#                 results.append(hour_result)
+        
+#         # Combine results efficiently
+#         print("Combining hour results...")
+#         non_empty_results = [df for df in results if len(df) > 0]
+        
+#         if non_empty_results:
+#             self.feature_matrix = pd.concat(non_empty_results, ignore_index=True, copy=False)
+            
+#             # Sort by timestamp
+#             self.feature_matrix = self.feature_matrix.sort_values('timestamp')
+            
+#             # Select final columns
+#             self.feature_matrix = self.feature_matrix[[
+#                 'timestamp', 
+#                 'order_book_imbalance',
+#                 'trade_flow_imbalance',
+#                 'volatility_cluster',
+#                 'spread_proxy',
+#                 'trade_arrival_rate',
+#                 'tick_imbalance'
+#             ]]
+#         else:
+#             # Create empty feature matrix with correct columns
+#             self.feature_matrix = pd.DataFrame(columns=[
+#                 'timestamp', 
+#                 'order_book_imbalance',
+#                 'trade_flow_imbalance',
+#                 'volatility_cluster',
+#                 'spread_proxy',
+#                 'trade_arrival_rate',
+#                 'tick_imbalance'
+#             ])
+        
+#         elapsed_time = time.time() - start_time
+#         print(f"Feature matrix built with {len(self.feature_matrix):,} rows in {elapsed_time:.1f} seconds")
+        
+#         return self.feature_matrix
+    
+#     def save_feature_matrix(self, output_path):
+#         """Save feature matrix to Parquet format using PyArrow"""
+#         if not hasattr(self, 'feature_matrix'):
+#             raise ValueError("Feature matrix has not been built yet")
+        
+#         print(f"Saving feature matrix to {output_path}...")
+#         start_time = time.time()
+        
+#         # Make sure directory exists
+#         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        
+#         # Define schema for saving
+#         pa_schema = pa.schema([
+#             ('timestamp', pa.timestamp('ns')),
+#             ('order_book_imbalance', pa.float32()),
+#             ('trade_flow_imbalance', pa.float32()),
+#             ('volatility_cluster', pa.float32()),
+#             ('spread_proxy', pa.float32()),
+#             ('trade_arrival_rate', pa.float32()),
+#             ('tick_imbalance', pa.float32())
+#         ])
+        
+#         # Save by month to keep files manageable
+#         self.feature_matrix['month'] = self.feature_matrix['timestamp'].dt.strftime('%Y%m')
+        
+#         for month, month_data in self.feature_matrix.groupby('month'):
+#             # Remove month column
+#             month_data = month_data.drop(columns=['month'])
+            
+#             # Create month directory
+#             month_dir = os.path.join(output_path, f"month={month}")
+#             os.makedirs(month_dir, exist_ok=True)
+            
+#             # Convert to PyArrow Table with schema
+#             table = pa.Table.from_pandas(month_data, schema=pa_schema)
+            
+#             # Save as Parquet
+#             pq.write_table(
+#                 table, 
+#                 os.path.join(month_dir, f"features.parquet"),
+#                 compression='snappy'
+#             )
+            
+#         elapsed_time = time.time() - start_time
+#         print(f"Feature matrix saved to {output_path} in {elapsed_time:.1f} seconds")
+        
+#         # Display summary
+#         print("\nFeature Matrix Summary:")
+#         print(f"Shape: {self.feature_matrix.shape}")
+#         print("\nFirst 5 rows:")
+#         print(self.feature_matrix.head())
+#         print("\nDescription:")
+#         print(self.feature_matrix.describe())
+    
+#     def cleanup(self):
+#         """Release resources"""
+#         print("Cleaning up resources...")
+        
+#         # Clear dataframes
+#         if hasattr(self, 'feature_matrix'):
+#             del self.feature_matrix
+#         if hasattr(self, 'time_grid'):
+#             del self.time_grid
+        
+#         # Force garbage collection
+#         gc.collect()
+        
+#         print("Resources cleaned up")
+
+
+# if __name__ == "__main__":
+#     # Configuration
+#     TICK_DATA_PATH = "ethusdt.csv"  # Path to CSV file
+#     OUTPUT_PATH = "eth_usdt_features_5s"  # Output directory
+    
+#     try:
+#         # Determine optimal resources based on system
+#         import psutil
+#         total_mem = psutil.virtual_memory().total / (1024**3)  # GB
+#         n_cores = psutil.cpu_count(logical=False)
+        
+#         # Set chunk size to fit in memory
+#         chunk_size_gb = max(1, min(2, total_mem / 6))  # Use 1/6th of RAM per chunk
+        
+#         print(f"System has {n_cores} cores and {total_mem:.1f}GB memory")
+#         print(f"Using chunk size of {chunk_size_gb:.1f}GB")
+        
+#         # Create feature builder with robust settings
+#         # Disable multiprocessing on Windows to avoid connection issues
+#         builder = ETHFeatureBuilder(
+#             delta_t=5,  # 5-second sampling
+#             volatility_window=60,  # 60-second window for volatility
+#             volatility_avg_intervals=12,  # Average over 12 intervals (1 minute)
+#             tick_history=20,  # Look at last 20 trades for tick imbalance
+#             chunk_size_gb=0.8,  # Fixed chunk size for stability
+#             use_multiprocessing=False  # Set to False for reliability on Windows
+#         )
+        
+#         # Store original CSV path for fallback
+#         builder.csv_path = TICK_DATA_PATH
+        
+#         # Load data (will reconvert if needed)
+#         builder.load_tick_data(TICK_DATA_PATH)
+        
+#         # Create time grid
+#         builder.create_time_grid()
+        
+#         # Build feature matrix
+#         feature_matrix = builder.build_feature_matrix()
+        
+#         # Save result
+#         builder.save_feature_matrix(OUTPUT_PATH)
+        
+#         # Clean up
+#         builder.cleanup()
+        
+#         print("Process completed successfully")
+        
+#     except Exception as e:
+#         print(f"Error during processing: {str(e)}")
+#         import traceback
+#         traceback.print_exc()
+#         sys.exit(1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import sys
+import time
+import gc
+import json
+import logging
+from datetime import datetime, timedelta
+from functools import partial
+import numpy as np
+import pandas as pd
+import dask
+import dask.dataframe as dd
+from dask.distributed import Client, progress, wait
+from dask import delayed
+import pyarrow as pa
+import pyarrow.parquet as pq
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('eth_feature_builder.log')
+    ]
+)
+logger = logging.getLogger('ETHFeatureBuilder')
+
+class ETHFeatureBuilder:
+    """
+    Constructs a feature matrix from tick-by-tick ETH/USDT market data
+    using Dask for distributed processing of extremely large datasets.
+    
+    This optimized implementation uses Dask for parallel processing and
+    advanced vectorized operations to efficiently handle very large datasets.
+    """
+    
+    def __init__(self, delta_t=5, volatility_window=60, volatility_avg_intervals=12, tick_history=20, 
+                 chunk_size_gb=2, scheduler='processes', n_workers=None, memory_limit=None,
+                 config_file=None):
+        """
+        Initialize ETH feature builder with Dask support
+        
+        Parameters:
+        -----------
+        delta_t : int
+            Sampling interval in seconds
+        volatility_window : int
+            Window (in seconds) for volatility calculation
+        volatility_avg_intervals : int
+            Number of intervals to average volatility over
+        tick_history : int
+            Number of recent trades for tick imbalance calculation
+        chunk_size_gb : float
+            Size of each data chunk in GB
+        scheduler : str
+            Dask scheduler to use ('processes', 'threads', or 'synchronous')
+        n_workers : int
+            Number of Dask workers (None = auto-detect)
+        memory_limit : str
+            Memory limit per worker (e.g., '4GB')
+        config_file : str
+            Path to JSON config file (overrides other parameters if provided)
+        """
+        # Load configuration from file if specified
+        if config_file and os.path.exists(config_file):
+            self._load_config(config_file)
+        else:
+            self.delta_t = delta_t
+            self.volatility_window = volatility_window
+            self.volatility_avg_intervals = volatility_avg_intervals
+            self.tick_history = tick_history
+            self.chunk_size_gb = chunk_size_gb
+            self.scheduler = scheduler
+        
+        # Auto-detect resources
+        import psutil
+        self.total_memory_gb = psutil.virtual_memory().total / (1024**3)
+        self.total_cores = psutil.cpu_count(logical=False)
+        
+        # Configure workers and memory limits
+        self.n_workers = n_workers or max(1, self.total_cores - 1)
+        self.memory_limit = memory_limit or f"{int(max(1, self.total_memory_gb / (self.n_workers * 2)))}GB"
+        
+        logger.info(f"Initialized with delta_t={self.delta_t}s, volatility_window={self.volatility_window}s")
+        logger.info(f"System has {self.total_cores} cores and {self.total_memory_gb:.1f}GB memory")
+        logger.info(f"Using Dask with {self.scheduler} scheduler")
+        
+        # Set up Dask client with specified resources
+        if self.scheduler == 'processes':
+            self.client = Client(n_workers=self.n_workers, 
+                                processes=True, 
+                                threads_per_worker=1, 
+                                memory_limit=self.memory_limit)
+        else:
+            self.client = Client(threads_per_worker=2, 
+                                processes=(self.scheduler == 'processes'),
+                                memory_limit=self.memory_limit)
+                                
+        logger.info(f"Dask dashboard available at: {self.client.dashboard_link}")
+        logger.info(f"Using {self.n_workers} workers with {self.memory_limit} memory per worker")
+    
+    def _load_config(self, config_file):
+        """Load configuration from JSON file"""
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                
+            self.delta_t = config.get('delta_t', 5)
+            self.volatility_window = config.get('volatility_window', 60)
+            self.volatility_avg_intervals = config.get('volatility_avg_intervals', 12)
+            self.tick_history = config.get('tick_history', 20)
+            self.chunk_size_gb = config.get('chunk_size_gb', 2)
+            self.scheduler = config.get('scheduler', 'processes')
+            
+            logger.info(f"Loaded configuration from {config_file}")
+        except Exception as e:
+            logger.error(f"Failed to load config from {config_file}: {str(e)}")
+            raise
+    
+    def convert_csv_to_parquet(self, csv_path, parquet_dir):
+        """
+        Convert CSV to optimized Parquet format using Dask for better performance
+        
+        Parameters:
+        -----------
+        csv_path : str
+            Path to input CSV file
+        parquet_dir : str
+            Path to output Parquet directory
+            
+        Returns:
+        --------
+        str
+            Path to parquet directory
+        """
+        logger.info(f"Converting CSV to Parquet format using Dask for faster processing...")
+        start_time = time.time()
+        
+        # Calculate optimal blocksize based on file size
+        file_size_bytes = os.path.getsize(csv_path)
+        file_size_gb = file_size_bytes / (1024**3)
+        
+        # Use smaller blocks for better parallelism
+        blocksize = min(int(self.chunk_size_gb * 1024**3), 
+                        int(file_size_bytes / (self.n_workers * 3)))
+        
+        logger.info(f"File size: {file_size_gb:.2f} GB")
+        logger.info(f"Using blocksize: {blocksize/1024**2:.1f} MB")
+        
+        # Ensure output directory exists
+        os.makedirs(parquet_dir, exist_ok=True)
+        
+        # Define column names, types and schema
+        columns = ['trade_id', 'price', 'quantity', 'trade_value', 'timestamp', 'is_buyer_maker', 'is_best_match']
+        dtypes = {
+            'trade_id': 'int64',
+            'price': 'float32',
+            'quantity': 'float32',
+            'trade_value': 'float32',
+            'timestamp': 'int64',
+            'is_buyer_maker': 'bool',
+            'is_best_match': 'bool'
+        }
+        
+        # Define PyArrow schema
+        pa_schema = pa.schema([
+            ('trade_id', pa.int64()),
+            ('price', pa.float32()),
+            ('quantity', pa.float32()),
+            ('trade_value', pa.float32()),
+            ('timestamp', pa.int64()),
+            ('is_buyer_maker', pa.bool_()),
+            ('is_best_match', pa.bool_()),
+            ('datetime', pa.timestamp('ns')),
+            ('hour', pa.string())
+        ])
+        
+        try:
+            # Read CSV with Dask
+            ddf = dd.read_csv(
+                csv_path,
+                blocksize=blocksize,
+                header=None,
+                names=columns,
+                dtype=dtypes,
+                assume_missing=True,
+                on_bad_lines='skip'
+            )
+            
+            # Add datetime column - this is a lazy operation in Dask
+            ddf['datetime'] = dd.to_datetime(ddf['timestamp'] / 1000000, unit='s')
+            
+            # Add hour column for partitioning
+            ddf['hour'] = ddf['datetime'].dt.strftime('%Y%m%d_%H')
+            
+            # Repartition to ensure optimal partition sizes (not too many small files)
+            optimal_partitions = max(1, min(100, int(file_size_gb * 2)))
+            if ddf.npartitions > optimal_partitions * 2:
+                logger.info(f"Repartitioning from {ddf.npartitions} to {optimal_partitions} partitions")
+                ddf = ddf.repartition(npartitions=optimal_partitions)
+            
+            # Write to partitioned parquet
+            logger.info(f"Writing to partitioned parquet files by hour...")
+            ddf.to_parquet(
+                parquet_dir,
+                engine='pyarrow',
+                compression='snappy',
+                partition_on=['hour'],
+                schema=pa_schema,
+                write_index=False
+            )
+            
+            # Create manifest file with partition information
+            partitions = ddf['hour'].unique().compute().tolist()
+            
+            # Get min/max times for each partition
+            partition_times = {}
+            for partition in partitions:
+                try:
+                    part_df = ddf[ddf['hour'] == partition][['datetime']].compute()
+                    if len(part_df) > 0:
+                        partition_times[partition] = {
+                            'min_time': part_df['datetime'].min().timestamp(),
+                            'max_time': part_df['datetime'].max().timestamp(),
+                            'n_rows': len(part_df)
+                        }
+                except Exception as e:
+                    logger.error(f"Error getting time range for partition {partition}: {str(e)}")
+            
+            manifest = {
+                'partitions': partitions,
+                'partition_times': partition_times,
+                'creation_time': datetime.now().isoformat(),
+                'total_partitions': len(partitions),
+                'schema': [str(f.name) + ":" + str(f.type) for f in pa_schema]
+            }
+            
+            with open(os.path.join(parquet_dir, '_manifest.json'), 'w') as f:
+                json.dump(manifest, f)
+                
+        except Exception as e:
+            logger.error(f"Error in Dask CSV conversion: {str(e)}")
+            logger.info("Falling back to chunked pandas conversion...")
+            
+            # Fallback to chunked pandas conversion if Dask fails
+            self._convert_csv_to_parquet_pandas(csv_path, parquet_dir, columns, dtypes)
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"CSV conversion completed in {elapsed_time:.1f} seconds")
+        logger.info(f"Parquet data saved to {parquet_dir}")
+        
+        return parquet_dir
+    
+    def _convert_csv_to_parquet_pandas(self, csv_path, parquet_dir, columns, dtypes):
+        """
+        Fallback method to convert CSV to parquet using pandas chunks
+        
+        This method is used if Dask conversion fails.
+        """
+        # Calculate chunk size
+        rows_per_gb = 20_000_000  # Approximate rows per GB
+        chunk_size = int(self.chunk_size_gb * rows_per_gb)
+        file_size_bytes = os.path.getsize(csv_path)
+        file_size_gb = file_size_bytes / (1024**3)
+        total_chunks = int(np.ceil(file_size_gb / self.chunk_size_gb))
+        
+        hour_partition_files = {}  # Track files by hour partition
+        
+        # Create schema
+        pa_schema = pa.schema([
+            ('trade_id', pa.int64()),
+            ('price', pa.float32()),
+            ('quantity', pa.float32()),
+            ('trade_value', pa.float32()),
+            ('timestamp', pa.int64()),
+            ('is_buyer_maker', pa.bool_()),
+            ('is_best_match', pa.bool_()),
+            ('datetime', pa.timestamp('ns'))  # Using nanoseconds for timestamp precision
+        ])
+        
+        # Process CSV in chunks
+        reader = pd.read_csv(
+            csv_path,
+            chunksize=chunk_size,
+            header=None,
+            names=columns,
+            dtype=dtypes,
+            on_bad_lines='skip'
+        )
+        
+        partition_times = {}  # Store min/max times for each partition
+        
+        for chunk_idx, chunk in enumerate(reader):
+            chunk_start_time = time.time()
+            logger.info(f"Processing chunk {chunk_idx+1}/{total_chunks} ({len(chunk):,} rows)...")
+            
+            # Convert timestamp to datetime
+            chunk['datetime'] = pd.to_datetime(chunk['timestamp'] / 1000000, unit='s')
+            
+            # Create hour partition
+            chunk['hour'] = chunk['datetime'].dt.strftime('%Y%m%d_%H')
+            
+            # Process each hour partition
+            for hour, hour_data in chunk.groupby('hour'):
+                # Track min/max times for each partition
+                if hour not in partition_times:
+                    partition_times[hour] = {
+                        'min_time': hour_data['datetime'].min().timestamp(),
+                        'max_time': hour_data['datetime'].max().timestamp(),
+                        'n_rows': 0
+                    }
+                else:
+                    partition_times[hour]['min_time'] = min(
+                        partition_times[hour]['min_time'],
+                        hour_data['datetime'].min().timestamp()
+                    )
+                    partition_times[hour]['max_time'] = max(
+                        partition_times[hour]['max_time'],
+                        hour_data['datetime'].max().timestamp()
+                    )
+                
+                partition_times[hour]['n_rows'] += len(hour_data)
+                
+                # Remove hour column before saving
+                hour_data = hour_data.drop(columns=['hour'])
+                
+                # Partition path
+                partition_path = os.path.join(parquet_dir, f"hour={hour}")
+                os.makedirs(partition_path, exist_ok=True)
+                
+                # File path for this partition
+                if hour in hour_partition_files:
+                    file_idx = hour_partition_files[hour] + 1
+                else:
+                    file_idx = 0
+                
+                hour_partition_files[hour] = file_idx
+                file_path = os.path.join(partition_path, f"part-{file_idx:05d}.parquet")
+                
+                # Save to parquet
+                table = pa.Table.from_pandas(hour_data, schema=pa_schema)
+                pq.write_table(table, file_path, compression='snappy')
+            
+            # Clean up
+            del chunk
+            gc.collect()
+            
+            chunk_time = time.time() - chunk_start_time
+            logger.info(f"Chunk {chunk_idx+1} processed in {chunk_time:.1f} seconds")
+        
+        # Create manifest file
+        manifest = {
+            'partitions': list(hour_partition_files.keys()),
+            'partition_times': partition_times,
+            'creation_time': datetime.now().isoformat(),
+            'total_partitions': len(hour_partition_files),
+            'schema': [str(f.name) + ":" + str(f.type) for f in pa_schema]
+        }
+        
+        with open(os.path.join(parquet_dir, '_manifest.json'), 'w') as f:
+            json.dump(manifest, f)
+    
+    def load_tick_data(self, data_path):
+        """
+        Prepare tick data for processing - converts to parquet if needed
+        
+        Parameters:
+        -----------
+        data_path : str
+            Path to the tick data file
+            
+        Returns:
+        --------
+        bool
+            True if data is loaded successfully
+        """
+        logger.info(f"Preparing tick data from {data_path}...")
+        
+        try:
+            # Check if file exists
+            if not os.path.exists(data_path):
+                raise ValueError(f"Data file not found at {data_path}")
+            
+            # Check if data is CSV or Parquet
+            parquet_dir = data_path + "_parquet"
+            is_csv = data_path.endswith(".csv")
+            
+            # Convert to Parquet if needed
+            if is_csv and not os.path.exists(parquet_dir):
+                logger.info(f"Large CSV detected. Converting to Parquet for better performance...")
+                self.convert_csv_to_parquet(data_path, parquet_dir)
+                self.data_dir = parquet_dir
+            elif is_csv and os.path.exists(parquet_dir):
+                logger.info(f"Using existing Parquet conversion")
+                self.data_dir = parquet_dir
+            else:
+                # Already a directory, assume parquet
+                self.data_dir = data_path
+            
+            # Validate the data directory
+            if not os.path.exists(self.data_dir):
+                raise ValueError(f"Data directory not found: {self.data_dir}")
+                
+            logger.info(f"Using data directory: {self.data_dir}")
+            
+            # Load manifest if it exists
+            manifest_path = os.path.join(self.data_dir, '_manifest.json')
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r') as f:
+                    manifest = json.load(f)
+                self.partitions = manifest['partitions']
+                self.partition_times = manifest.get('partition_times', {})
+                logger.info(f"Loaded {len(self.partitions)} partitions from manifest")
+            else:
+                # Get partitions by scanning directory
+                if os.path.isdir(self.data_dir):
+                    hours = []
+                    for item in os.listdir(self.data_dir):
+                        if item.startswith("hour="):
+                            hours.append(item.replace("hour=", ""))
+                    hours.sort()
+                    
+                    if hours:
+                        self.partitions = hours
+                        logger.info(f"Found {len(hours)} hour partitions from {hours[0]} to {hours[-1]}")
+                        
+                        # Build partition_times dictionary
+                        self.partition_times = {}
+                    else:
+                        # Not partitioned by hour
+                        files = [f for f in os.listdir(self.data_dir) if f.endswith('.parquet')]
+                        if files:
+                            logger.info(f"Found {len(files)} parquet files in directory (non-partitioned)")
+                            self.partitions = None
+                        else:
+                            raise ValueError(f"No parquet files found in {self.data_dir}")
+                else:
+                    self.partitions = None
+            
+            # Create Dask dataframe (lazy loading)
+            self._create_dask_dataframe()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error preparing data: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # If using existing parquet but validation failed, try reconverting
+            if is_csv and os.path.exists(parquet_dir) and not hasattr(self, 'ddf'):
+                logger.info("Attempting to reconvert CSV to fix data issues...")
+                backup_dir = parquet_dir + "_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+                os.rename(parquet_dir, backup_dir)
+                logger.info(f"Moved existing parquet directory to {backup_dir}")
+                
+                # Try conversion again
+                self.convert_csv_to_parquet(data_path, parquet_dir)
+                self.data_dir = parquet_dir
+                
+                # Try creating dataframe again
+                self._create_dask_dataframe()
+                return True
+            else:
+                raise
+    
+    def _create_dask_dataframe(self):
+        """Create a Dask dataframe from the parquet data"""
+        logger.info("Creating Dask dataframe from parquet data...")
+        
+        # Configure optimal read for arrow engine
+        storage_options = {
+            'blocksize': '64MB'  # Helps with parallel reading
+        }
+        
+        # Create Dask dataframe from parquet files
+        self.ddf = dd.read_parquet(
+            self.data_dir, 
+            engine='pyarrow',
+            storage_options=storage_options
+        )
+        
+        # Ensure datetime column exists with nanosecond precision
+        if 'datetime' not in self.ddf.columns and 'timestamp' in self.ddf.columns:
+            self.ddf['datetime'] = dd.to_datetime(self.ddf['timestamp'] / 1000000, unit='s')
+        
+        logger.info(f"Dask dataframe created with {len(self.ddf.columns)} columns")
+        logger.info(f"Partition structure: {self.ddf.npartitions} partitions")
+        
+        # Load a sample to validate
+        sample = self.ddf.head(5)
+        logger.info("\nSample data:")
+        logger.info(f"{sample}")
+        
+        # Optimize partitioning if needed
+        if self.ddf.npartitions < self.n_workers:
+            logger.info(f"Repartitioning from {self.ddf.npartitions} to {self.n_workers} partitions")
+            self.ddf = self.ddf.repartition(npartitions=self.n_workers)
+    
+    def create_time_grid(self):
+        """
+        Create the time grid for sampling
+        
+        Returns:
+        --------
+        pandas.DataFrame
+            DataFrame with grid points
+        """
+        logger.info("Creating time grid...")
+        start_time = time.time()
+        
+        # Use partition_times if available to get time range efficiently
+        if hasattr(self, 'partition_times') and self.partition_times:
+            # Extract min and max times from partition_times
+            min_time = min(p['min_time'] for p in self.partition_times.values() if 'min_time' in p)
+            max_time = max(p['max_time'] for p in self.partition_times.values() if 'max_time' in p)
+            
+            min_dt = pd.Timestamp.fromtimestamp(min_time)
+            max_dt = pd.Timestamp.fromtimestamp(max_time)
+            
+            logger.info(f"Time range from manifest: {min_dt} to {max_dt}")
+        else:
+            # Calculate min and max time using Dask (compute is required)
+            min_dt = self.ddf['datetime'].min().compute()
+            max_dt = self.ddf['datetime'].max().compute()
+            logger.info(f"Computed time range: {min_dt} to {max_dt}")
+        
+        # Round down min_dt to nearest delta_t
+        min_dt = min_dt.replace(second=min_dt.second - (min_dt.second % self.delta_t), microsecond=0)
+        
+        # Create time grid with pandas (relatively small operation)
+        grid_times = pd.date_range(start=min_dt, end=max_dt, freq=f"{self.delta_t}S")
+        
+        # Create DataFrame with grid index
+        self.time_grid = pd.DataFrame({
+            'grid_idx': range(len(grid_times)),
+            'timestamp': grid_times
+        })
+        
+        # Create prev_timestamp for interval calculations
+        self.time_grid['prev_timestamp'] = self.time_grid['timestamp'].shift(1)
+        if len(self.time_grid) > 0:
+            self.time_grid.loc[0, 'prev_timestamp'] = self.time_grid.loc[0, 'timestamp'] - pd.Timedelta(seconds=self.delta_t)
+        
+        # Group by hour for partitioned processing
+        self.time_grid['hour'] = self.time_grid['timestamp'].dt.strftime('%Y%m%d_%H')
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Created time grid with {len(self.time_grid):,} intervals in {elapsed_time:.1f} seconds")
+        
+        return self.time_grid
+    
+    def _process_hour_batch(self, hour_data):
+        """
+        Process a single hour batch of data
+        
+        Parameters:
+        -----------
+        hour_data : tuple
+            (hour, grid_batch) tuple containing hour identifier and grid points
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Feature matrix for this hour
+        """
+        hour, grid_batch = hour_data
+        
+        logger.info(f"Processing hour {hour}...")
+        batch_start_time = time.time()
+        
+        # Exit early if no grid points
+        if len(grid_batch) == 0:
+            logger.info(f"No grid points in hour {hour}, skipping")
+            return pd.DataFrame()
+        
+        # Load trade data for this hour
+        hour_dt = datetime.strptime(hour, '%Y%m%d_%H')
+        
+        # Determine lookback period for features that need history
+        lookback_time = max(self.volatility_window, self.delta_t * self.tick_history) + 60
+        lookback_hour = (hour_dt - timedelta(seconds=lookback_time)).strftime('%Y%m%d_%H')
+        
+        try:
+            # Create filter for Dask dataframe
+            if hasattr(self, 'partitions') and self.partitions:
+                # For partitioned data
+                hour_filter = self.ddf['hour'] == hour
+                if lookback_hour in self.partitions:
+                    lookback_filter = self.ddf['hour'] == lookback_hour
+                    trades_filter = hour_filter | lookback_filter
+                else:
+                    trades_filter = hour_filter
+            else:
+                # For non-partitioned data, filter by timestamp
+                end_time = hour_dt + timedelta(hours=1)
+                start_time = hour_dt - timedelta(seconds=lookback_time)
+                trades_filter = (self.ddf['datetime'] >= start_time) & (self.ddf['datetime'] < end_time)
+            
+            # Extract trades - this will compute and materialize the data
+            trades_df = self.ddf[trades_filter].compute()
+            
+            if len(trades_df) == 0:
+                logger.info(f"No trade data for hour {hour}, skipping")
+                return pd.DataFrame()
+            
+            # Sort by time once for all operations
+            trades_df = trades_df.sort_values('datetime')
+            
+            # Pre-compute common data used in multiple features
+            trades_df = self._prepare_trade_data(trades_df)
+            
+            # Fully vectorized feature calculation
+            features = self._calculate_features_vectorized(trades_df, grid_batch)
+            
+            # Clean up
+            del trades_df
+            gc.collect()
+            
+            elapsed_time = time.time() - batch_start_time
+            logger.info(f"Hour {hour} completed in {elapsed_time:.1f} seconds")
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error processing hour {hour}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return pd.DataFrame()
+    
+    def _prepare_trade_data(self, trades_df):
+        """
+        Prepare trade data for feature calculation
+        
+        This function adds common fields used in multiple feature calculations.
+        
+        Parameters:
+        -----------
+        trades_df : pandas.DataFrame
+            DataFrame containing trades
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            Prepared trade data
+        """
+        # Pre-calculate buy and sell volumes
+        trades_df['buy_volume'] = np.where(~trades_df['is_buyer_maker'], trades_df['quantity'], 0)
+        trades_df['sell_volume'] = np.where(trades_df['is_buyer_maker'], trades_df['quantity'], 0)
+        
+        # Pre-calculate price changes for tick imbalance
+        trades_df['price_diff'] = trades_df['price'].diff()
+        trades_df['uptick'] = np.where(trades_df['price_diff'] > 0, 1, 0)
+        trades_df['downtick'] = np.where(trades_df['price_diff'] < 0, 1, 0)
+        
+        return trades_df
+    
+    def _calculate_features_vectorized(self, trades_df, grid_batch):
+        """
+        Calculate all features using vectorized operations
+        
+        Parameters:
+        -----------
+        trades_df : pandas.DataFrame
+            DataFrame containing trades
+        grid_batch : pandas.DataFrame
+            DataFrame containing grid points
+                
+        Returns:
+        --------
+        pandas.DataFrame
+            Feature matrix
+        """
+        # Initialize features dataframe with grid points
+        features = grid_batch.copy()
+        
+        # Cache these window sizes for performance
+        window_size = max(30, self.delta_t * 3)  # For OBI
+        volatility_window = self.volatility_window  # For volatility
+        
+        # Empty result case
+        if len(trades_df) == 0:
+            features['order_book_imbalance'] = 0
+            features['trade_flow_imbalance'] = 0
+            features['volatility_cluster'] = 1.0
+            features['spread_proxy'] = 0
+            features['trade_arrival_rate'] = 0
+            features['tick_imbalance'] = 0
+            return features
+        
+        # Convert timestamps to nanoseconds (integers) for consistent comparison
+        grid_ts_ns = features['timestamp'].astype(np.int64).values
+        prev_ts_ns = features['prev_timestamp'].astype(np.int64).values
+        trades_ts_ns = trades_df['datetime'].astype(np.int64).values
+        
+        # Initialize feature arrays
+        n_grid = len(grid_batch)
+        obi_values = np.zeros(n_grid)
+        tfi_values = np.zeros(n_grid)
+        spread_values = np.zeros(n_grid)
+        arrival_values = np.zeros(n_grid)
+        vol_i_values = np.zeros(n_grid)
+        tick_imb_values = np.zeros(n_grid)
+        
+        # Numpy arrays for trade data
+        buy_vol_array = trades_df['buy_volume'].values
+        sell_vol_array = trades_df['sell_volume'].values
+        price_array = trades_df['price'].values
+        uptick_array = trades_df['uptick'].values
+        downtick_array = trades_df['downtick'].values
+        
+        # Use numpy searchsorted for fast interval lookups
+        trades_ts_sorted_idx = np.argsort(trades_ts_ns)
+        trades_ts_sorted = trades_ts_ns[trades_ts_sorted_idx]
+        
+        # Process each grid point with vectorized operations
+        for i in range(n_grid):
+            grid_time_ns = grid_ts_ns[i]
+            prev_time_ns = prev_ts_ns[i]
+            
+            # Find trades in OBI window - convert timedelta to nanoseconds
+            obi_window_ns = pd.Timedelta(seconds=window_size).asm8.astype(np.int64)
+            obi_window_start_ns = grid_time_ns - obi_window_ns
+            obi_start_idx = np.searchsorted(trades_ts_sorted, obi_window_start_ns, side='right')
+            obi_end_idx = np.searchsorted(trades_ts_sorted, grid_time_ns, side='right')
+            
+            if obi_start_idx < obi_end_idx:
+                # Get indices of trades in window
+                obi_indices = trades_ts_sorted_idx[obi_start_idx:obi_end_idx]
+                
+                # Sum buy and sell volumes
+                buy_vol = np.sum(buy_vol_array[obi_indices])
+                sell_vol = np.sum(sell_vol_array[obi_indices])
+                total_vol = buy_vol + sell_vol
+                
+                if total_vol > 0:
+                    obi_values[i] = (buy_vol - sell_vol) / total_vol
+            
+            # Find trades in current interval for TFI, spread, arrival rate
+            interval_start_idx = np.searchsorted(trades_ts_sorted, prev_time_ns, side='right')
+            interval_end_idx = np.searchsorted(trades_ts_sorted, grid_time_ns, side='right')
+            
+            if interval_start_idx < interval_end_idx:
+                # Get indices of trades in interval
+                interval_indices = trades_ts_sorted_idx[interval_start_idx:interval_end_idx]
+                trade_count = len(interval_indices)
+                
+                # Calculate Trade Flow Imbalance
+                buy_vol = np.sum(buy_vol_array[interval_indices])
+                sell_vol = np.sum(sell_vol_array[interval_indices])
+                total_vol = buy_vol + sell_vol
+                
+                if total_vol > 0:
+                    tfi_values[i] = (buy_vol - sell_vol) / total_vol
+                
+                # Calculate Spread Proxy
+                interval_prices = price_array[interval_indices]
+                if len(interval_prices) > 1:
+                    spread_values[i] = np.max(interval_prices) - np.min(interval_prices)
+                
+                # Set trade arrival rate
+                arrival_values[i] = trade_count / self.delta_t
+            
+            # Find trades in volatility window
+            vol_window_ns = pd.Timedelta(seconds=volatility_window).asm8.astype(np.int64)
+            vol_window_start_ns = grid_time_ns - vol_window_ns
+            vol_start_idx = np.searchsorted(trades_ts_sorted, vol_window_start_ns, side='right')
+            vol_end_idx = np.searchsorted(trades_ts_sorted, grid_time_ns, side='right')
+            
+            if vol_start_idx < vol_end_idx:
+                # Get indices of trades in window
+                vol_indices = trades_ts_sorted_idx[vol_start_idx:vol_end_idx]
+                vol_prices = price_array[vol_indices]
+                
+                # Calculate std dev for volatility
+                if len(vol_prices) > 1:
+                    vol_i_values[i] = np.std(vol_prices)
+            
+            # Find recent trades for tick imbalance
+            tick_end_idx = np.searchsorted(trades_ts_sorted, grid_time_ns, side='right')
+            if tick_end_idx > 0:
+                # Take up to tick_history trades
+                tick_start_idx = max(0, tick_end_idx - self.tick_history)
+                
+                if tick_start_idx < tick_end_idx:
+                    # Get indices of recent trades
+                    tick_indices = trades_ts_sorted_idx[tick_start_idx:tick_end_idx]
+                    
+                    # Count upticks and downticks
+                    upticks = np.sum(uptick_array[tick_indices])
+                    downticks = np.sum(downtick_array[tick_indices])
+                    
+                    total_ticks = upticks + downticks
+                    if total_ticks > 0:
+                        tick_imb_values[i] = (upticks - downticks) / total_ticks
+        
+        # Assign computed values to features DataFrame
+        features['order_book_imbalance'] = obi_values
+        features['trade_flow_imbalance'] = tfi_values
+        features['spread_proxy'] = spread_values
+        features['trade_arrival_rate'] = arrival_values
+        
+        # Calculate rolling volatility cluster
+        features['vol_i'] = vol_i_values
+        features = features.sort_values('grid_idx')
+        features['mu_i'] = features['vol_i'].rolling(window=self.volatility_avg_intervals, min_periods=1).mean()
+        features['volatility_cluster'] = np.where(features['mu_i'] > 0, features['vol_i'] / features['mu_i'], 1.0)
+        
+        features['tick_imbalance'] = tick_imb_values
+        
+        # Drop intermediate columns
+        features = features.drop(columns=['vol_i', 'mu_i'])
+        
+        # Fill NAs with 0
+        features = features.fillna(0)
+        
+        return features
+    
+    def build_feature_matrix(self):
+        """
+        Build the complete feature matrix
+        
+        Returns:
+        --------
+        pandas.DataFrame
+            Complete feature matrix
+        """
+        logger.info("Building feature matrix...")
+        start_time = time.time()
+        
+        # Create time grid if not already created
+        if not hasattr(self, 'time_grid'):
+            self.create_time_grid()
+        
+        # Group grid points by hour
+        hour_groups = [(hour, group) for hour, group in self.time_grid.groupby('hour')]
+        
+        logger.info(f"Processing {len(hour_groups)} unique hours")
+        
+        # Process each hour sequentially - more reliable than using Dask for this step
+        all_results = []
+        
+        for i, hour_data in enumerate(hour_groups):
+            hour = hour_data[0]
+            logger.info(f"Processing hour {i+1}/{len(hour_groups)}: {hour}")
+            
+            # Process each hour batch individually
+            result = self._process_hour_batch(hour_data)
+            
+            if len(result) > 0:
+                all_results.append(result)
+                logger.info(f"Hour {hour} produced {len(result)} feature rows")
+            else:
+                logger.info(f"Hour {hour} produced no results")
+            
+            # Force garbage collection after each hour
+            gc.collect()
+        
+        # Combine results
+        logger.info("Combining all results...")
+        
+        if all_results:
+            self.feature_matrix = pd.concat(all_results, ignore_index=True)
+            
+            # Sort by timestamp
+            self.feature_matrix = self.feature_matrix.sort_values('timestamp')
+            
+            # Select final columns
+            self.feature_matrix = self.feature_matrix[[
+                'timestamp', 
+                'order_book_imbalance',
+                'trade_flow_imbalance',
+                'volatility_cluster',
+                'spread_proxy',
+                'trade_arrival_rate',
+                'tick_imbalance'
+            ]]
+        else:
+            # Create empty feature matrix
+            self.feature_matrix = pd.DataFrame(columns=[
+                'timestamp', 
+                'order_book_imbalance',
+                'trade_flow_imbalance',
+                'volatility_cluster',
+                'spread_proxy',
+                'trade_arrival_rate',
+                'tick_imbalance'
+            ])
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Feature matrix built with {len(self.feature_matrix):,} rows in {elapsed_time:.1f} seconds")
+        
+        return self.feature_matrix
+    
+    def save_feature_matrix(self, output_path):
+        """
+        Save feature matrix to Parquet format
+        
+        Parameters:
+        -----------
+        output_path : str
+            Path to output directory
+        """
+        if not hasattr(self, 'feature_matrix'):
+            raise ValueError("Feature matrix has not been built yet")
+        
+        logger.info(f"Saving feature matrix to {output_path}...")
+        start_time = time.time()
+        
+        # Make sure directory exists
+        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        
+        # Define schema for saving with nanosecond precision
+        pa_schema_no_month = pa.schema([
+            ('timestamp', pa.timestamp('ns')),
+            ('order_book_imbalance', pa.float32()),
+            ('trade_flow_imbalance', pa.float32()),
+            ('volatility_cluster', pa.float32()),
+            ('spread_proxy', pa.float32()),
+            ('trade_arrival_rate', pa.float32()),
+            ('tick_imbalance', pa.float32())
+        ])
+        
+        # Add month column for partitioning
+        self.feature_matrix['month'] = self.feature_matrix['timestamp'].dt.strftime('%Y%m')
+        
+        # Save partitioned by month (using pandas for reliability)
+        for month, month_data in self.feature_matrix.groupby('month'):
+            # Create month directory
+            month_dir = os.path.join(output_path, f"month={month}")
+            os.makedirs(month_dir, exist_ok=True)
+            
+            # Remove month column before saving
+            month_data = month_data.drop(columns=['month'])
+            
+            # Save as Parquet
+            table = pa.Table.from_pandas(month_data, schema=pa_schema_no_month)
+            pq.write_table(
+                table, 
+                os.path.join(month_dir, f"features.parquet"),
+                compression='snappy'
+            )
+        
+        # Create metadata file
+        metadata = {
+            'creation_time': datetime.now().isoformat(),
+            'delta_t': self.delta_t,
+            'volatility_window': self.volatility_window,
+            'volatility_avg_intervals': self.volatility_avg_intervals,
+            'tick_history': self.tick_history,
+            'months': self.feature_matrix['month'].unique().tolist(),
+            'n_rows': len(self.feature_matrix),
+            'min_time': self.feature_matrix['timestamp'].min().isoformat(),
+            'max_time': self.feature_matrix['timestamp'].max().isoformat()
+        }
+        
+        with open(os.path.join(output_path, '_metadata.json'), 'w') as f:
+            json.dump(metadata, f)
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Feature matrix saved to {output_path} in {elapsed_time:.1f} seconds")
+        
+        # Display summary statistics
+        logger.info("\nFeature Matrix Summary:")
+        logger.info(f"Shape: {self.feature_matrix.shape}")
+        logger.info("\nFirst 5 rows:")
+        logger.info(f"{self.feature_matrix.head()}")
+        logger.info("\nDescription:")
+        logger.info(f"{self.feature_matrix.describe()}")
+        
+        # Clean up by removing the month column
+        self.feature_matrix = self.feature_matrix.drop(columns=['month'])
+        
+        return True
+    
+    def cleanup(self):
+        """Release resources"""
+        logger.info("Cleaning up resources...")
+        
+        # Clear dataframes
+        if hasattr(self, 'feature_matrix'):
+            del self.feature_matrix
+        if hasattr(self, 'time_grid'):
+            del self.time_grid
+        if hasattr(self, 'ddf'):
+            del self.ddf
+            
+                # Close Dask client with proper error handling
+        if hasattr(self, 'client') and self.client is not None:
+            try:
+                # Silence Dask's warning logs during shutdown
+                import logging
+                dask_logger = logging.getLogger("distributed")
+                original_level = dask_logger.level
+                dask_logger.setLevel(logging.ERROR)
+                
+                # Close client
+                logger.info("Closing Dask client...")
+                self.client.close(timeout=10)
+                
+                # Restore logging level
+                dask_logger.setLevel(original_level)
+            except Exception as e:
+                logger.warning(f"Non-critical error during Dask client shutdown: {str(e)}")
+            finally:
+                self.client = None
+        
+        # Force garbage collection
+        gc.collect()
+        
+        logger.info("Resources cleaned up")
+
+
+if __name__ == "__main__":
+    # Configuration
+    TICK_DATA_PATH = "ethusdt.csv"  # Path to CSV file
+    OUTPUT_PATH = "eth_usdt_features_5s"  # Output directory
+    
+    try:
+        # Create feature builder with optimized settings
+        builder = ETHFeatureBuilder(
+            delta_t=5,  # 5-second sampling
+            volatility_window=60,  # 60-second window for volatility
+            volatility_avg_intervals=12,  # Average over 12 intervals (1 minute)
+            tick_history=20,  # Look at last 20 trades for tick imbalance
+            chunk_size_gb=1,  # Smaller chunk size for better parallelism
+            scheduler='processes'  # Use process-based parallelism for better isolation
+        )
+        
+        # Store original CSV path for fallback
+        builder.csv_path = TICK_DATA_PATH
+        
+        # Load data
+        builder.load_tick_data(TICK_DATA_PATH)
+        
+        # Create time grid
+        builder.create_time_grid()
+        
+        # Build feature matrix
+        feature_matrix = builder.build_feature_matrix()
+        
+        # Save result
+        builder.save_feature_matrix(OUTPUT_PATH)
+        
+        # Clean up
+        builder.cleanup()
+        
+        logger.info("Process completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error during processing: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)

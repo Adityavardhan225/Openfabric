@@ -1,0 +1,37 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Tick Aggregator",
+            "type": "shell",
+            "command": "g++",
+            "args": [
+                "-std=c++17",
+                "-O3",
+                "-DNOMINMAX",
+                "tick_aggregate.cpp",
+                "-o",
+                "tick_aggregate",
+                "-pthread"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Run Tick Aggregator",
+            "type": "shell",
+            "command": "${workspaceFolder}/tick_aggregate.exe",
+            "args": [
+                "--file",
+                "your_actual_tick_data.csv",
+                "--output",
+                "aggregated_candles.csv",
+                "--duration",
+                "13"
+            ],
+            "dependsOn": "Build Tick Aggregator"
+        }
+    ]
+}
